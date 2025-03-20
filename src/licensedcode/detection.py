@@ -20,6 +20,7 @@ import attr
 from collections import defaultdict
 from license_expression import combine_expressions
 from license_expression import Licensing
+from typecode import get_type
 
 from commoncode.resource import clean_path
 from commoncode.text import python_safe_name
@@ -1925,6 +1926,8 @@ def detect_licenses(
     min_score=0,
     deadline=sys.maxsize,
     as_expression=False,
+    max_lines=None,
+    use_cache=True,
     **kwargs
 ):
     """
@@ -1939,16 +1942,64 @@ def detect_licenses(
 
     If this function is called within the package license detection,
     `package_license` is `True`, to enable package license specific heuristics.
+
+    If `max_lines` is provided, only scan that many lines from the start of the file.
+    If not provided, use a default based on the file type.
+
+    If `use_cache` is True (default), try to use cached results based on file header.
     """
     if location and query_string:
         raise Exception("Only one of location or query_string should be provided")
 
     if not location and not query_string:
-        return
+        return []
 
     if not index:
         from licensedcode import cache
         index = cache.get_index()
+        cache_obj = cache.get_cache()
+    else:
+        cache_obj = None
+
+    # 如果提供了location,尝试使用缓存
+    header_content = None
+    if location and use_cache and cache_obj:
+        with open(location, 'rb') as f:
+            content = f.read()
+            try:
+                content = content.decode('utf-8')
+            except UnicodeDecodeError:
+                # 如果不是文本文件,跳过缓存
+                content = None
+                
+        if content:
+            from licensedcode.header_detection import get_file_header
+            header_content = get_file_header(
+                filename=location,
+                content=content,
+                max_lines=max_lines or 30
+            )
+            if header_content:
+                header_hash = cache_obj.compute_header_hash(header_content)
+                cached_result = cache_obj.get_cached_header_detection(header_hash)
+                if cached_result:
+                    return cached_result or []
+
+                # 如果没有缓存命中,但是我们已经提取了header,
+                # 就直接用header内容做检测
+                query_string = header_content
+                location = None
+
+    # 确定要读取的行数
+    if max_lines is None:
+        if location:
+            T = get_type(location)
+            if T.is_binary:
+                max_lines = 50  # 二进制文件多读一些行
+            else:
+                max_lines = 30  # 文本文件默认读30行
+        else:
+            max_lines = 30  # 字符串默认读30行
 
     license_matches = index.match(
         location=location,
@@ -1957,24 +2008,32 @@ def detect_licenses(
         deadline=deadline,
         as_expression=as_expression,
         unknown_licenses=unknown_licenses,
+        max_lines=max_lines,
         **kwargs,
     )
 
     if not license_matches:
-        return
+        return []
 
     if TRACE:
         logger_debug(f"detection: detect_licenses: location: {location}: query_string: {query_string}")
 
     detections = []
     for group_of_matches in group_matches(license_matches=license_matches):
-        detections.append(
-            LicenseDetection.from_matches(
-                matches=group_of_matches,
-                analysis=analysis,
-                post_scan=post_scan,
-                package_license=package_license,
-            )
+        detection = LicenseDetection.from_matches(
+            matches=group_of_matches,
+            analysis=analysis,
+            post_scan=post_scan,
+            package_license=package_license,
         )
+        if detection:  # Only append if detection is not None
+            detections.append(detection)
 
-    yield from process_detections(detections=detections)
+    results = list(process_detections(detections=detections))
+
+    # 如果使用了缓存且有header内容,保存结果到缓存
+    if use_cache and cache_obj and header_content:
+        header_hash = cache_obj.compute_header_hash(header_content)
+        cache_obj.cache_file_header(header_hash, results)
+
+    return results or []  # Always return a list, even if empty

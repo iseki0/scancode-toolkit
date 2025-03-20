@@ -10,6 +10,9 @@
 import os
 import pickle
 from shutil import rmtree
+from hashlib import sha1
+from functools import partial
+import click
 
 from commoncode.fileutils import create_dir
 
@@ -64,6 +67,82 @@ class LicenseCache:
         # Additional licenses from directory and plugins
         self.additional_license_directory = additional_license_directory
         self.additional_license_plugins = additional_license_plugins
+        
+        # Initialize header cache only
+        self.header_cache = {}
+        # 添加简单计数器
+        self.hits = 0
+        self.misses = 0
+
+    def cache_file_header(self, header_hash, detection_result):
+        """
+        Cache detection result for a given file header hash.
+        """
+        self.header_cache[header_hash] = detection_result
+
+    def get_cached_header_detection(self, header_hash):
+        """
+        Get cached detection result for a given file header hash.
+        """
+        result = self.header_cache.get(header_hash)
+        if result:
+            self.hits += 1
+        else:
+            self.misses += 1
+        return result
+
+    def compute_header_hash(self, content, location=None):
+        """
+        Compute hash based on tokenized content, ignoring variable parts like filenames.
+        
+        Args:
+            content: The content to hash
+            location: The file path being processed
+        """
+        if not content:
+            return None
+            
+        # tokens to skip
+        skip_tokens = {
+            '\\file', '@file', 'file:', 'filename:', 
+            '.h', '.c', '.hpp', '.cpp', '.cc',
+            '\\brief', '@brief',
+            '\\copyright', '@copyright'
+        }
+        
+        # tokenize and filter content
+        normalized_tokens = []
+        for line in content.splitlines():
+            # skip empty lines
+            if not line.strip():
+                continue
+                
+            # split into words
+            for token in line.split():
+                token = token.strip('*/\\\'\"<>[](){}')
+                
+                # skip filenames and paths
+                if ('/' in token or '\\' in token or 
+                    any(x in token.lower() for x in skip_tokens)):
+                    continue
+                    
+                # keep meaningful tokens
+                if token:
+                    normalized_tokens.append(token.lower())
+        
+        # generate hash from tokens
+        normalized = ' '.join(normalized_tokens)
+        hash_value = sha1(normalized.encode('utf-8')).hexdigest()
+        
+        # Only output in trace mode
+        from scancode import TRACE
+        if TRACE and location:
+            click.echo(f"Processing: {location}", err=True, fg='green')
+            click.echo("=== Content for hash computation ===", err=True, fg='green')
+            click.echo(normalized, err=True, fg='green')
+            click.echo(f"Hash: {hash_value}", err=True, fg='green')
+            
+        return hash_value
 
     @staticmethod
     def load_or_build(
@@ -434,9 +513,16 @@ def load_cache_file(cache_file):
     Return a LicenseCache loaded from ``cache_file``.
     """
     with open(cache_file, 'rb') as lfc:
-        # Note: weird but read() + loads() is much (twice++???) faster than load()
         try:
-            return pickle.load(lfc)
+            cache = pickle.load(lfc)
+            # Initialize new cache attributes if they don't exist
+            if not hasattr(cache, 'header_cache'):
+                cache.header_cache = {}
+            if not hasattr(cache, 'hits'):
+                cache.hits = 0
+            if not hasattr(cache, 'misses'):  
+                cache.misses = 0
+            return cache
         except Exception as e:
             msg = (
                 'ERROR: Failed to load license cache (the file may be corrupted ?).\n'
@@ -444,6 +530,7 @@ def load_cache_file(cache_file):
                 'If the problem persists, copy this error message '
                 'and submit a bug report at https://github.com/nexB/scancode-toolkit/issues/'
             )
+            click.echo(msg, err=True, fg='red')
             raise Exception(msg) from e
 
 

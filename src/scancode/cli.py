@@ -19,6 +19,7 @@ import os
 import platform
 import sys
 import traceback
+import attr
 
 from collections import defaultdict
 from functools import partial
@@ -27,6 +28,7 @@ from time import sleep
 from time import time
 
 import commoncode
+from commoncode.datautils import String, List, Integer  # Add Integer import
 
 # this exception is not available on posix
 try:
@@ -288,6 +290,12 @@ def validate_input_path(ctx, param, value):
         'the starting directory. Use 0 for no scan depth limit.',
     help_group=cliutils.CORE_GROUP, sort_order=301, cls=PluggableCommandLineOption)
 
+@click.option('--skip-inventory',
+    is_flag=True,
+    default=False,
+    help='Skip collecting detailed file inventory information (size, dates, checksums).',
+    help_group=cliutils.CORE_GROUP, sort_order=301, cls=PluggableCommandLineOption)
+
 @click.help_option('-h', '--help',
     help_group=cliutils.DOC_GROUP, sort_order=10, cls=PluggableCommandLineOption)
 
@@ -391,6 +399,7 @@ def scancode(
     test_error_mode,
     keep_temp_files,
     check_version,
+    skip_inventory,
     echo_func=echo_stderr,
     *args,
     **kwargs,
@@ -501,10 +510,10 @@ def scancode(
             test_error_mode=test_error_mode,
             keep_temp_files=keep_temp_files,
             pretty_params=pretty_params,
-            # results are saved to file, no need to get them back in a cli context
             return_results=False,
             echo_func=echo_func,
             outdated=outdated,
+            skip_inventory=skip_inventory,
             *args,
             **kwargs
         )
@@ -539,7 +548,6 @@ def run_scan(
     echo_func=None,
     timing=False,
     keep_temp_files=False,
-    # TODO: Review return_results as it does not return Packages and Dependencies
     return_results=True,
     return_codebase=False,
     test_mode=False,
@@ -548,6 +556,7 @@ def run_scan(
     pretty_params=None,
     plugin_options=plugin_options,
     outdated=None,
+    skip_inventory=False,
     *args,
     **kwargs
 ):
@@ -859,7 +868,7 @@ def run_scan(
 
         inventory_start = time()
 
-        if not quiet:
+        if not quiet and not skip_inventory:
             echo_func('Collect file inventory...', fg='green')
 
         if from_json:
@@ -869,9 +878,37 @@ def run_scan(
             codebase_class = Codebase
             codebase_load_error_msg = 'ERROR: failed to collect codebase at: %(input)r'
 
-        # TODO: add progress indicator
-        # Note: inventory timing collection is built in Codebase initialization
-        # TODO: this should also collect the basic size/dates
+        # Add minimal resource attributes when skipping inventory
+        if skip_inventory:
+            # Override resource attributes to only include essential ones
+            resource_attributes = {
+                'path': String(help='Resource path'),
+                'type': String(help='Resource type'),
+                'name': String(help='Resource name'),
+                'base_name': String(help='Resource base name'),
+                'extension': String(help='Resource extension'),
+                'size': Integer(help='Resource size in bytes'),
+            }
+            # Add license and copyright attributes since we need them
+            resource_attributes.update({
+                'licenses': List(help='Detected licenses'),
+                'license_expressions': List(help='License expressions'),
+                'detected_license_expression': String(help='Detected license expression'),
+                'detected_license_expression_spdx': String(help='Detected license expression in SPDX format'),
+                'percentage_of_license_text': Integer(help='Percentage of license text'),
+                'license_detections': List(help='License detection details'),
+                'license_clues': List(help='License detection clues'),
+                'matched_rule_license_expression': String(help='License expression from matched rule'),
+                'matched_rule_identifier': String(help='Identifier of matched license rule'),
+                'copyrights': List(help='Detected copyrights'),
+                'holders': List(help='Copyright holders'),
+                'authors': List(help='Authors'),
+            })
+        else:
+            resource_attributes = {}
+            for _, name, attribs in sorted(sortable_resource_attributes):
+                resource_attributes.update(attribs)
+
         try:
             codebase = codebase_class(
                 location=input,

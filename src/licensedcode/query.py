@@ -115,41 +115,34 @@ def build_query(
     text_line_threshold=15,
     bin_line_threshold=50,
     start_line=1,
+    max_lines=30,
 ):
     """
-    Return a Query built from location or query string given an index.
+    Return a Query built from location or query string.
+    If max_lines is set, only process up to that many lines.
     """
     if location:
         T = typecode.get_type(location)
-        # TODO: implement additional type-driven heuristics for query chunking.
         if not T.contains_text:
             return
         if T.is_binary:
-            # for binaries we want to avoid a large number of query runs as the
-            # license context is often very sparse or absent
-            qry = Query(
-                location=location,
-                idx=idx,
-                line_threshold=bin_line_threshold,
-                start_line=start_line,
-            )
+            # for binaries we want to break in smaller lines
+            line_threshold = bin_line_threshold
         else:
-            # for text
-            qry = Query(
-                location=location,
-                idx=idx,
-                line_threshold=text_line_threshold,
-                start_line=start_line,
-            )
+            # for texts we want to break in larger chunks
+            line_threshold = text_line_threshold
     else:
-        # a string is always considered text
-        qry = Query(
-            query_string=query_string,
-            idx=idx,
-            start_line=start_line,
-        )
+        # the same for texts
+        line_threshold = text_line_threshold
 
-    return qry
+    return Query(
+        location=location,
+        query_string=query_string,
+        idx=idx,
+        line_threshold=line_threshold,
+        start_line=start_line,
+        max_lines=max_lines,
+    )
 
 
 class Query(object):
@@ -191,6 +184,7 @@ class Query(object):
         'has_long_lines',
         'is_binary',
         'start_line',
+        'max_lines',
     )
 
     def __init__(
@@ -200,6 +194,7 @@ class Query(object):
         idx=None,
         line_threshold=LINES_THRESHOLD,
         start_line=1,
+        max_lines=None,
         _test_mode=False,
     ):
         """
@@ -208,6 +203,7 @@ class Query(object):
         Break query in runs when there are at least `line_threshold` empty lines
         or junk-only lines.
         Line numbers start at ``start_line`` which is 1-based by default.
+        If max_lines is set, only process up to that many lines.
         """
         assert (location or query_string) and idx
 
@@ -217,6 +213,7 @@ class Query(object):
 
         self.line_threshold = line_threshold
         self.start_line = start_line
+        self.max_lines = max_lines
 
         # True if the text is made of very long lines
         self.has_long_lines = False
@@ -287,6 +284,7 @@ class Query(object):
             location=location,
             query_string=query_string,
             start_line=start_line,
+            max_lines=max_lines,
         )
 
         # this method has side effects to populate various data structures
@@ -362,10 +360,12 @@ class Query(object):
         location=None,
         query_string=None,
         start_line=1,
+        max_lines=None,
     ):
         """
         Yield multiple sequences of tokens, one for each line in this query.
         Line numbers start at ``start_line`` which is 1-based by default.
+        If max_lines is set, only process up to that many lines.
 
         SIDE EFFECT: This populates the query `line_by_pos`, `unknowns_by_pos`,
         `unknowns_span`, `stopwords_by_pos`, `shorts_and_digits_pos` and `spdx_lines` .
@@ -413,7 +413,12 @@ class Query(object):
             for line_num, line in qlines:
                 logger_debug(' ', line_num, ':', line)
 
+        lines_processed = 0
         for line_num, line in qlines:
+            if max_lines and lines_processed >= max_lines:
+                break
+            lines_processed += 1
+
             if TRACE_STOP_AND_UNKNOWN:
                 logger_debug(f'  line: {line_num}: {line!r}')
 
@@ -941,3 +946,132 @@ def tokens_ngram_processor(tokens, ngram_len):
     if ngram:
         # yield last ngram
         yield tuple(ngram)
+
+
+class LicenseMatch:
+    def __init__(self):
+        self.header_start_offset = 0  # 距离文件头开始的偏移行数
+        self.match_length = 0  # 匹配的行数
+        
+def cache_file_header(self, header_hash, detection_result):
+    """缓存时保存相对位置"""
+    cached_matches = []
+    header_start = detection_result[0].start_line
+    
+    for match in detection_result:
+        cached_match = match.copy()
+        # 转换为相对位置
+        cached_match.header_start_offset = match.start_line - header_start
+        cached_match.match_length = match.end_line - match.start_line + 1
+        cached_matches.append(cached_match)
+        
+    self.header_cache[header_hash] = cached_matches
+
+def apply_cached_detection(self, cached_matches, actual_header_start):
+    """使用缓存结果时重新计算实际行号"""
+    results = []
+    for cached_match in cached_matches:
+        match = cached_match.copy()
+        # 根据实际文件头位置重新计算行号
+        match.start_line = actual_header_start + cached_match.header_start_offset
+        match.end_line = match.start_line + cached_match.match_length - 1
+        results.append(match)
+    return results
+
+def detect_licenses(location=None, use_cache=True):
+    if location and use_cache:
+        header_content = get_file_header(location)
+        if header_content:
+            # 获取文件头的实际起始位置
+            header_start = get_header_start_line(location)
+            
+            # 计算部分匹配的哈希
+            header_hash = compute_flexible_header_hash(header_content)
+            
+            cached_result = cache.get_cached_header_detection(header_hash)
+            if cached_result:
+                # 使用实际的文件头位置重新计算行号
+                return cache.apply_cached_detection(
+                    cached_result,
+                    actual_header_start=header_start
+                )
+
+def get_header_start_line(location):
+    """获取许可证头部在文件中的实际起始行"""
+    with open(location) as f:
+        for i, line in enumerate(f, 1):
+            if is_license_header_start(line):
+                return i
+    return 1
+
+def is_license_header_start(line):
+    """检测一行是否是许可证头部的开始"""
+    patterns = [
+        r'/\*',  # C-style comment
+        r'#',    # Shell/Python style
+        r'<!--', # XML/HTML
+        r'"""',  # Python docstring
+        r'\/\/', # C++ style
+        # 添加更多模式...
+    ]
+    return any(re.search(pattern, line) for pattern in patterns)
+
+def compute_flexible_header_hash(content):
+    """计算可以部分匹配的哈希,同时记录结构信息"""
+    lines = content.splitlines()
+    
+    # 提取关键特征
+    features = {
+        'line_count': len(lines),
+        'comment_style': detect_comment_style(lines),
+        'key_terms': extract_license_terms(content),
+        'structure_hash': compute_structure_hash(lines)
+    }
+    
+    return features
+
+def is_header_similar(features1, features2, threshold=0.8):
+    """检查两个文件头是否足够相似"""
+    score = 0.0
+    weights = {
+        'line_count': 0.1,
+        'comment_style': 0.2,
+        'key_terms': 0.4,
+        'structure_hash': 0.3
+    }
+    
+    # 比较各个特征
+    if abs(features1['line_count'] - features2['line_count']) <= 2:
+        score += weights['line_count']
+        
+    if features1['comment_style'] == features2['comment_style']:
+        score += weights['comment_style']
+        
+    terms_similarity = len(
+        set(features1['key_terms']) & set(features2['key_terms'])
+    ) / len(set(features1['key_terms']) | set(features2['key_terms']))
+    score += terms_similarity * weights['key_terms']
+    
+    structure_similarity = compare_structure(
+        features1['structure_hash'],
+        features2['structure_hash']
+    )
+    score += structure_similarity * weights['structure_hash']
+    
+    return score >= threshold
+
+def verify_cached_detection(cached_matches, actual_content):
+    """验证缓存的匹配结果是否适用于实际内容"""
+    for match in cached_matches:
+        # 提取实际内容中对应位置的文本
+        actual_text = extract_text_at_position(
+            actual_content,
+            match.start_line,
+            match.end_line
+        )
+        
+        # 检查实际文本是否与预期匹配
+        if not text_matches_rule(actual_text, match.rule):
+            return False
+            
+    return True
